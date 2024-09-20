@@ -435,3 +435,17 @@ This repository is released under the MIT license. See [LICENSE](LICENSE) for ad
 * The [Block Pushing](./diffusion_policy/env/block_pushing) task is adapted from [BET](https://github.com/notmahi/bet) and [IBC](https://github.com/google-research/ibc).
 * The [Kitchen](./diffusion_policy/env/kitchen) task is adapted from [BET](https://github.com/notmahi/bet) and [Relay Policy Learning](https://github.com/google-research/relay-policy-learning).
 * Our [shared_memory](./diffusion_policy/shared_memory) data structures are heavily inspired by [shared-ndarray2](https://gitlab.com/osu-nrsg/shared-ndarray2).
+
+## Gotcha
+Installing dgl:
+```
+mamba install -c dglteam/label/th21_cu118 dgl
+```
+
+Install pkg for EquiformerV2:
+```
+mamba install pytorch_cluster pytorch_scatter
+mamba install e3nn
+pip install torch_geometric
+```
+
