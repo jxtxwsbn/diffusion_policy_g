@@ -100,15 +100,11 @@ class ConditionalUnet1D(nn.Module):
             dim_in = local_cond_dim
             local_cond_encoder = nn.ModuleList([
                 # down encoder
-                ConditionalResidualBlock1D(
-                    dim_in, dim_out, cond_dim=cond_dim, 
-                    kernel_size=kernel_size, n_groups=n_groups,
-                    cond_predict_scale=cond_predict_scale),
-                # up encoder
-                ConditionalResidualBlock1D(
-                    dim_in, dim_out, cond_dim=cond_dim, 
-                    kernel_size=kernel_size, n_groups=n_groups,
-                    cond_predict_scale=cond_predict_scale)
+                nn.Conv1d(dim_in, dim_out, kernel_size, padding=kernel_size//2),
+                # nn.Conv1d(dim_in, dim_out, kernel_size, padding=kernel_size//2),
+                # # up encoder
+                # nn.Conv1d(dim_in, dim_out, kernel_size, padding=kernel_size//2),
+                # nn.Conv1d(dim_in, dim_out, kernel_size, padding=kernel_size//2),
             ])
 
         mid_dim = all_dims[-1]
@@ -181,7 +177,7 @@ class ConditionalUnet1D(nn.Module):
         global_cond: (B,global_cond_dim)
         output: (B,T,input_dim)
         """
-        sample = einops.rearrange(sample, 'b h t -> b t h')
+        sample = einops.rearrange(sample, 'b h c -> b c h')
 
         # 1. time
         timesteps = timestep
@@ -204,18 +200,17 @@ class ConditionalUnet1D(nn.Module):
         h_local = list()
         if local_cond is not None:
             local_cond = einops.rearrange(local_cond, 'b h t -> b t h')
-            resnet, resnet2 = self.local_cond_encoder
-            x = resnet(local_cond, global_feature)
-            h_local.append(x)
-            x = resnet2(local_cond, global_feature)
-            h_local.append(x)
+            for conv in self.local_cond_encoder:
+                x = conv(local_cond)
+                h_local.append(x)
         
         x = sample
         h = []
         for idx, (resnet, resnet2, downsample) in enumerate(self.down_modules):
             x = resnet(x, global_feature)
             if idx == 0 and len(h_local) > 0:
-                x = x + h_local[0]
+                # x = x * h_local[0] + h_local[1]
+                x = x + h_local[1]
             x = resnet2(x, global_feature)
             h.append(x)
             x = downsample(x)
@@ -226,17 +221,12 @@ class ConditionalUnet1D(nn.Module):
         for idx, (resnet, resnet2, upsample) in enumerate(self.up_modules):
             x = torch.cat((x, h.pop()), dim=1)
             x = resnet(x, global_feature)
-            # The correct condition should be:
-            # if idx == (len(self.up_modules)-1) and len(h_local) > 0:
-            # However this change will break compatibility with published checkpoints.
-            # Therefore it is left as a comment.
-            if idx == len(self.up_modules) and len(h_local) > 0:
-                x = x + h_local[1]
             x = resnet2(x, global_feature)
             x = upsample(x)
+            # if idx == len(self.up_modules) - 1 and len(h_local) > 0:
+            #     x = x * h_local[2] + h_local[3]
 
         x = self.final_conv(x)
 
         x = einops.rearrange(x, 'b t h -> b h t')
         return x
-
