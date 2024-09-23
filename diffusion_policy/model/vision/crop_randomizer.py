@@ -14,6 +14,7 @@ class CropRandomizer(nn.Module):
         crop_width, 
         num_crops=1,
         pos_enc=False,
+        fixed_crop=False,
     ):
         """
         Args:
@@ -35,6 +36,7 @@ class CropRandomizer(nn.Module):
         self.crop_width = crop_width
         self.num_crops = num_crops
         self.pos_enc = pos_enc
+        self.fixed_crop = fixed_crop
 
     def output_shape_in(self, input_shape=None):
         """
@@ -83,7 +85,7 @@ class CropRandomizer(nn.Module):
         inputs to [B * N, ...].
         """
         assert len(inputs.shape) >= 3 # must have at least (C, H, W) dimensions
-        if self.training:
+        if self.training and not self.fixed_crop:
             # generate random crops
             out, _ = sample_random_image_crops(
                 images=inputs,
