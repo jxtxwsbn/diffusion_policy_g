@@ -1,3 +1,4 @@
+import copy
 from typing import Dict
 import math
 import torch
@@ -19,6 +20,76 @@ import diffusion_policy.model.vision.crop_randomizer as dmvc
 from diffusion_policy.common.pytorch_util import dict_apply, replace_submodules
 
 
+class Canonicalizer(nn.Module):
+    def __init__(self, input_shape, To):
+        '''
+
+        Parameters
+        ----------
+        input_shape: image shape
+        To:  time step of observation
+        '''
+        super().__init__()
+        self.input_shape = input_shape
+        self.To = To
+
+    def canonicalize(self, obs, traj=None):
+        '''
+
+        Parameters
+        ----------
+        obs: obs in the original coordinate system
+        traj: action sequence in the original coordinate system
+
+        Returns
+        -------
+        canonicalized data in the agent_pos coordinate system
+        '''
+        img,  pose = obs['image'], obs['agent_pos']
+        canonicalized_obs = copy.copy(obs)
+        bs = pose.shape[0]
+
+        pose_w_h = pose.reshape(-1, 2)[::self.To].clone().repeat_interleave(self.To, 0)
+        canonicalized_obs['agent_pos'] = pose.reshape(-1, 2) - pose_w_h
+        pose_w_h += 1
+        pose_w_h *= (self.input_shape[1] - 1) / 2
+        pose_w_h = torch.round(pose_w_h)
+        idxs = torch.clamp(pose_w_h, 0, self.input_shape[1]).long()
+
+        pad = self.input_shape[1] // 2
+        padded_img = torch.nn.functional.pad(img, (pad, pad, pad, pad), mode='constant', value=1)
+        canonicalized_img = []
+        for i in range(bs):
+            canonicalized_img.append(padded_img[i:i+1, :,
+                                     idxs[i, 1]:idxs[i, 1]+self.input_shape[1],
+                                     idxs[i, 0]:idxs[i, 0]+self.input_shape[2]])
+        canonicalized_img = torch.cat(canonicalized_img)
+        canonicalized_obs['image'] = canonicalized_img
+        canonicalized_traj = None
+        if traj is not None:
+            canonicalized_traj = traj.clone()
+            canonicalized_traj -= pose[::self.To, :].unsqueeze(1)
+
+        return canonicalized_obs, canonicalized_traj
+
+    def uncanonicalize(self, obs, traj):
+        '''
+
+        Parameters
+        ----------
+        obs
+        traj in the agent_pos coordinate system
+
+        Returns
+        -------
+        pose in the original coordinate system
+        '''
+        pose = traj.clone()
+        pose += obs['agent_pos'][::self.To, :].unsqueeze(1)
+        pose = torch.clamp(pose, -1, 1)
+        return pose
+
+
 class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
     def __init__(self, 
             shape_meta: dict,
@@ -36,6 +107,9 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
             cond_predict_scale=True,
             obs_encoder_group_norm=False,
             eval_fixed_crop=False,
+            fixed_crop=False,
+            canonicalize=False,
+            canonicalize_traj=False,
             # parameters passed to step
             **kwargs):
         super().__init__()
@@ -70,7 +144,7 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
             hdf5_type='image',
             task_name='square',
             dataset_type='ph')
-        
+
         with config.unlocked():
             # set config with shape_meta
             config.observation.modalities.obs = obs_config
@@ -111,9 +185,14 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
                     num_channels=x.num_features)
             )
             # obs_encoder.obs_nets['agentview_image'].nets[0].nets
-        
+
+        self.canonicalizer = None
+        if canonicalize:
+            self.canonicalizer = Canonicalizer(input_shape=shape, To=n_obs_steps)
+        self.canonicalize_traj = canonicalize_traj
+
         # obs_encoder.obs_randomizers['agentview_image']
-        if eval_fixed_crop:
+        if eval_fixed_crop or fixed_crop:
             replace_submodules(
                 root_module=obs_encoder,
                 predicate=lambda x: isinstance(x, rmbn.CropRandomizer),
@@ -122,13 +201,14 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
                     crop_height=x.crop_height,
                     crop_width=x.crop_width,
                     num_crops=x.num_crops,
-                    pos_enc=x.pos_enc
+                    pos_enc=x.pos_enc,
+                    fixed_crop=fixed_crop
                 )
             )
 
         # create diffusion model
         obs_feature_dim = obs_encoder.output_shape()[0]
-        input_dim = action_dim + obs_feature_dim
+        input_dim = action_dim + obs_feature_dim * n_obs_steps
         global_cond_dim = None
         if obs_as_global_cond:
             input_dim = action_dim
@@ -150,7 +230,7 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
         self.noise_scheduler = noise_scheduler
         self.mask_generator = LowdimMaskGenerator(
             action_dim=action_dim,
-            obs_dim=0 if obs_as_global_cond else obs_feature_dim,
+            obs_dim=0 if obs_as_global_cond else obs_feature_dim * n_obs_steps,
             max_n_obs_steps=n_obs_steps,
             fix_obs_steps=True,
             action_visible=False
@@ -196,8 +276,12 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
             trajectory[condition_mask] = condition_data[condition_mask]
 
             # 2. predict model output
-            model_output = model(trajectory, t, 
-                local_cond=local_cond, global_cond=global_cond)
+            if self.canonicalize_traj:
+                in_traj = trajectory.clone()
+                in_traj[:, 1:, :] = in_traj[:, 1:, :] - in_traj[:, :-1, :]
+            else:
+                in_traj = trajectory
+            model_output = model(in_traj, t, local_cond=local_cond, global_cond=global_cond)
 
             # 3. compute previous image: x_t -> x_t-1
             trajectory = scheduler.step(
@@ -207,7 +291,9 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
                 ).prev_sample
         
         # finally make sure conditioning is enforced
-        trajectory[condition_mask] = condition_data[condition_mask]        
+        trajectory[condition_mask] = condition_data[condition_mask]
+        if self.canonicalize_traj:
+            trajectory[:, 1:, :] = trajectory[:, 1:, :] + trajectory[:, :-1, :]
 
         return trajectory
 
@@ -237,7 +323,11 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
         if self.obs_as_global_cond:
             # condition through global feature
             this_nobs = dict_apply(nobs, lambda x: x[:,:To,...].reshape(-1,*x.shape[2:]))
-            nobs_features = self.obs_encoder(this_nobs)
+            if self.canonicalizer is not None:
+                canonicalized_this_nobs, _ = self.canonicalizer.canonicalize(this_nobs)
+                nobs_features = self.obs_encoder(canonicalized_this_nobs)
+            else:
+                nobs_features = self.obs_encoder(this_nobs)
             # reshape back to B, Do
             global_cond = nobs_features.reshape(B, -1)
             # empty data for action
@@ -245,14 +335,15 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
             cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
         else:
             # condition through impainting
-            this_nobs = dict_apply(nobs, lambda x: x[:,:To,...].reshape(-1,*x.shape[2:]))
+            this_nobs = dict_apply(nobs,
+                lambda x: x[:,:self.n_obs_steps,...].reshape(-1, *x.shape[2:]))
             nobs_features = self.obs_encoder(this_nobs)
             # reshape back to B, To, Do
-            nobs_features = nobs_features.reshape(B, To, -1)
-            cond_data = torch.zeros(size=(B, T, Da+Do), device=device, dtype=dtype)
+            nobs_features = nobs_features.reshape(B, 1, -1).repeat(1, T, 1)
+            cond_data = torch.zeros(size=(B, T, Da+Do*To), device=device, dtype=dtype)
             cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
-            cond_data[:,:To,Da:] = nobs_features
-            cond_mask[:,:To,Da:] = True
+            cond_data[:,:T,Da:] = nobs_features
+            cond_mask[:,:T,Da:] = True
 
         # run sampling
         nsample = self.conditional_sample(
@@ -264,6 +355,8 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
         
         # unnormalize prediction
         naction_pred = nsample[...,:Da]
+        if self.canonicalizer is not None:
+            naction_pred = self.canonicalizer.uncanonicalize(this_nobs, naction_pred)
         action_pred = self.normalizer['action'].unnormalize(naction_pred)
 
         # get action
@@ -297,16 +390,25 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
         if self.obs_as_global_cond:
             # reshape B, T, ... to B*T
             this_nobs = dict_apply(nobs, 
-                lambda x: x[:,:self.n_obs_steps,...].reshape(-1,*x.shape[2:]))
-            nobs_features = self.obs_encoder(this_nobs)
+                lambda x: x[:,:self.n_obs_steps,...].reshape(-1, *x.shape[2:]))
+            if self.canonicalizer is not None:
+                canonicalized_this_nobs, trajectory = self.canonicalizer.canonicalize(this_nobs, trajectory)
+                nobs_features = self.obs_encoder(canonicalized_this_nobs)
+                if self.canonicalize_traj:
+                    trajectory = trajectory.clone()
+                    trajectory[:, 1:, :] = trajectory[:, 1:, :] - trajectory[:, :-1, :]
+            else:
+                nobs_features = self.obs_encoder(this_nobs)
             # reshape back to B, Do
             global_cond = nobs_features.reshape(batch_size, -1)
+
         else:
             # reshape B, T, ... to B*T
-            this_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))
+            this_nobs = dict_apply(nobs,
+                lambda x: x[:,:self.n_obs_steps,...].reshape(-1, *x.shape[2:]))
             nobs_features = self.obs_encoder(this_nobs)
             # reshape back to B, T, Do
-            nobs_features = nobs_features.reshape(batch_size, horizon, -1)
+            nobs_features = nobs_features.reshape(batch_size, 1, -1).repeat(1, horizon, 1)
             cond_data = torch.cat([nactions, nobs_features], dim=-1)
             trajectory = cond_data.detach()
 
@@ -345,7 +447,7 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
             raise ValueError(f"Unsupported prediction type {pred_type}")
 
         loss = F.mse_loss(pred, target, reduction='none')
-        loss = loss * loss_mask.type(loss.dtype)
+        loss = loss[loss_mask]
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
         loss = loss.mean()
         return loss

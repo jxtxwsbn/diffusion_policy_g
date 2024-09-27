@@ -99,7 +99,8 @@ class PushTEnv(gym.Env):
             state = np.array([
                 rs.randint(50, 450), rs.randint(50, 450),
                 rs.randint(100, 400), rs.randint(100, 400),
-                rs.randn() * 2 * np.pi - np.pi
+                rs.randn() * 2 * np.pi - np.pi,
+                rs.randint(100, 400), rs.randint(100, 400),
                 ])
         self._set_state(state)
 
@@ -235,9 +236,13 @@ class PushTEnv(gym.Env):
             pygame.quit()
     
     def seed(self, seed=None):
+        random_trans_eval = False
+        if isinstance(seed, tuple):
+            seed, random_trans_eval = seed
         if seed is None:
             seed = np.random.randint(0,25536)
         self._seed = seed
+        self._random_trans_eval = random_trans_eval
         self.np_random = np.random.default_rng(seed)
 
     def _handle_collision(self, arbiter, space, data):
@@ -249,6 +254,9 @@ class PushTEnv(gym.Env):
         pos_agent = state[:2]
         pos_block = state[2:4]
         rot_block = state[4]
+        pos_goal = state[5:7]
+        if self._random_trans_eval:
+            self.goal_pose[:2] = pos_goal
         self.agent.position = pos_agent
         # setting angle rotates with respect to center of mass
         # therefore will modify the geometric position
